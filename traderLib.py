@@ -4,9 +4,9 @@ import sys
 import json
 import os
 import pandas as pd
-import matplotlib.pyplot as plt  # Import matplotlib for graph plotting
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-from sentiment_analysis import fetch_news_articles, analyze_news_sentiment, analyze_sentiment
+from sentiment_analysis import fetch_news_articles, analyze_sentiment
 
 # Load configuration from config.json
 def load_config():
@@ -25,14 +25,13 @@ class Trader:
         self.ticker = ticker
         lg.info(f'Trader initialized with ticker {ticker}')
 
-    def get_historical_data(self, period='100D'):
+    def get_historical_data(self, months=18):
         """
-        Fetch OHLC data for the specified period (e.g., '100D' for 100 days).
+        Fetch OHLC data for the past X months (default: 18 months for more data).
         """
         try:
-            # Calculate the date range for the last 100 trading days
             end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=100)).strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=months * 30)).strftime('%Y-%m-%d')
 
             # Fetch historical OHLC data
             bars = api.get_bars(
@@ -42,10 +41,9 @@ class Trader:
                 end=end_date,
                 limit=100,
                 adjustment='raw',
-                feed='iex'  # Use IEX data
+                feed='iex'
             )
 
-            # Convert OHLC data to a DataFrame for easy manipulation
             df = pd.DataFrame({
                 'Open': [bar.o for bar in bars],
                 'High': [bar.h for bar in bars],
@@ -54,6 +52,10 @@ class Trader:
                 'Volume': [bar.v for bar in bars]
             })
 
+            if df.empty:
+                lg.error(f"No OHLC data available for {self.ticker}.")
+                sys.exit()
+
             return df
         except Exception as e:
             lg.error(f'Error fetching OHLC data: {e}')
@@ -61,17 +63,15 @@ class Trader:
 
     def plot_stock_data(self, df):
         """
-        Plot the stock prices (OHLC) for the last 100 days.
+        Plot the stock prices (OHLC) for the past year.
         """
         plt.figure(figsize=(10, 6))
-
-        # Plotting the Open, High, Low, and Close values
         plt.plot(df.index, df['Open'], label='Open', color='blue', alpha=0.7)
         plt.plot(df.index, df['High'], label='High', color='green', alpha=0.7)
         plt.plot(df.index, df['Low'], label='Low', color='red', alpha=0.7)
         plt.plot(df.index, df['Close'], label='Close', color='black', alpha=0.7)
 
-        plt.title(f'{self.ticker} Stock Prices - Last 100 Days')
+        plt.title(f'{self.ticker} Stock Prices - Last 12 Months')
         plt.xlabel('Date')
         plt.ylabel('Price')
         plt.legend(loc='upper left')
@@ -79,33 +79,71 @@ class Trader:
         plt.show()
 
     def calculate_moving_average(self, df, period=50):
-        """
-        Calculate the moving average for the given period (e.g., 50 days or 100 days).
-        """
         if len(df) < period:
             lg.info(f"Not enough data to calculate {period}-day moving average.")
-            return float('nan')
+            return df['Close'].rolling(window=len(df)).mean().iloc[-1]  # Use available data
         return df['Close'].rolling(window=period).mean().iloc[-1]
 
-    def calculate_rsi(self, df, period=14):
-        """
-        Calculate the Relative Strength Index (RSI) for the given period (default is 14 days).
-        """
-        delta = df['Close'].diff(1)
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
+    def check_moving_average_crossover(self, df):
+        short_term_ma = df['Close'].rolling(window=50).mean()
+        long_term_ma = df['Close'].rolling(window=200).mean()
 
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
+        if short_term_ma.iloc[-1] > long_term_ma.iloc[-1] and short_term_ma.iloc[-2] <= long_term_ma.iloc[-2]:
+            return "Golden Cross - Buy Signal"
+        elif short_term_ma.iloc[-1] < long_term_ma.iloc[-1] and short_term_ma.iloc[-2] >= long_term_ma.iloc[-2]:
+            return "Death Cross - Sell Signal"
+        return "No Crossover Detected"
 
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.iloc[-1]  # Latest RSI value
+    def calculate_macd(self, df):
+        short_ema = df['Close'].ewm(span=12, adjust=False).mean()
+        long_ema = df['Close'].ewm(span=26, adjust=False).mean()
+        macd = short_ema - long_ema
+        signal = macd.ewm(span=9, adjust=False).mean()
+
+        if macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2]:
+            return "MACD Bullish Crossover - Buy Signal"
+        elif macd.iloc[-1] < signal.iloc[-1] and macd.iloc[-2] >= signal.iloc[-2]:
+            return "MACD Bearish Crossover - Sell Signal"
+        return "No MACD Crossover Detected"
+
+    def calculate_bollinger_bands(self, df):
+        mid_band = df['Close'].rolling(window=20).mean()
+        std = df['Close'].rolling(window=20).std()
+        upper_band = mid_band + (std * 2)
+        lower_band = mid_band - (std * 2)
+
+        return upper_band, lower_band
+
+    def calculate_bollinger_band_width(self, df):
+        """
+        Calculate the Bollinger Band width.
+        """
+        upper_band, lower_band = self.calculate_bollinger_bands(df)
+        band_width = (upper_band.iloc[-1] - lower_band.iloc[-1]) / lower_band.iloc[-1]
+        return band_width
+
+    def calculate_adx(self, df, period=14):
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = low.diff().clip(upper=0).abs()
+        tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+
+        atr = tr.rolling(window=period).mean()
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
+        adx = dx.rolling(window=period).mean()
+
+        return adx.iloc[-1]
 
     def check_volume_spike(self, df):
-        """
-        Check if the current volume is at least 15% higher than the 30-day average volume.
-        """
+        if len(df) < 30:
+            lg.info("Not enough data to calculate 30-day volume average.")
+            return False
+
         avg_volume = df['Volume'].rolling(window=30).mean().iloc[-1]
         latest_volume = df['Volume'].iloc[-1]
         return latest_volume >= 1.15 * avg_volume
@@ -133,54 +171,68 @@ class Trader:
 
     def should_buy(self, df):
         """
-        Decision-making logic with updated conditions:
-        1. Adjusted sentiment threshold.
-        2. Price comparison with short, mid, and long-term moving averages.
-        3. Flexibility with RSI levels.
-        4. Lower volume spike threshold.
+        Decision-making logic with updated conditions and dynamic thresholding.
         """
         last_close = df['Close'].iloc[-1]
         sentiment_score = self.fetch_and_analyze_news()
-        
-        # Plot the stock chart before evaluating buy signal
-        self.plot_stock_data(df)
-        
-        # Calculate short, mid, and long-term moving averages
-        short_term_ma = self.calculate_moving_average(df, period=20)
-        mid_term_ma = self.calculate_moving_average(df, period=50)
-        long_term_ma = self.calculate_moving_average(df, period=100)
-        
-        rsi = self.calculate_rsi(df)
-        volume_spike = self.check_volume_spike(df)
 
-        # Log the indicator values
-        lg.info(f"Last Close: {last_close}")
-        lg.info(f"Short-Term (20-day) Moving Average: {short_term_ma}")
-        lg.info(f"Mid-Term (50-day) Moving Average: {mid_term_ma}")
-        lg.info(f"Long-Term (100-day) Moving Average: {long_term_ma}")
-        lg.info(f"RSI (14-day): {rsi}")
+        # Moving averages crossover
+        ma_crossover = self.check_moving_average_crossover(df)
+        lg.info(ma_crossover)
+
+        # MACD
+        macd_signal = self.calculate_macd(df)
+        lg.info(macd_signal)
+
+        # Bollinger Bands
+        upper_band, lower_band = self.calculate_bollinger_bands(df)
+        if last_close > upper_band.iloc[-1]:
+            lg.info(f"Bollinger Bands Breakout (Above Upper Band) - Potential Buy Signal")
+        elif last_close < lower_band.iloc[-1]:
+            lg.info(f"Bollinger Bands Breakout (Below Lower Band) - Potential Sell Signal")
+
+        # ADX (Trend Strength)
+        adx_value = self.calculate_adx(df)
+        lg.info(f"ADX Value: {adx_value} - Trend Strength")
+
+        # Volume Spike
+        volume_spike = self.check_volume_spike(df)
         lg.info(f"Volume Spike: {volume_spike}")
 
-        # Assign weightages to each indicator (adjusting for flexibility)
-        sentiment_weight = 0.5 if sentiment_score >= 3 else 0.0
-        price_weight = 0.1 if last_close >= short_term_ma else 0.0
-        price_weight += 0.2 if last_close >= mid_term_ma else 0.0
-        price_weight += 0.2 if last_close >= long_term_ma else 0.0
-        rsi_weight = 0.2 if 50 < rsi < 75 else 0.1 if rsi < 50 else 0.0
+        # Calculate Bollinger Band Width
+        band_width = (upper_band.iloc[-1] - lower_band.iloc[-1]) / upper_band.iloc[-1]
+        lg.info(f"Bollinger Band Width: {band_width}")
+
+        # Dynamic threshold based on volatility (Bollinger Band Width)
+        dynamic_threshold = 0.5 if band_width > 0.05 else 0.6
+        lg.info(f"Dynamic threshold based on volatility: {dynamic_threshold * 100}%")
+
+        # Weightage system
+        sentiment_weight = 0.2 if sentiment_score >= 3 else 0.0
+        ma_weight = 0.15 if "Golden Cross" in ma_crossover else 0.0
+        macd_weight = 0.15 if "Bullish Crossover" in macd_signal else 0.0
+        adx_weight = 0.1 if adx_value >= 25 else 0.0
         volume_weight = 0.1 if volume_spike else 0.0
 
         # Calculate the overall score
-        overall_score = sentiment_weight + price_weight + rsi_weight + volume_weight
+        overall_score = sentiment_weight + ma_weight + macd_weight + adx_weight + volume_weight
 
         lg.info(f"Overall Score: {overall_score * 100}%")
 
-        # Define a threshold (e.g., 60%) for issuing a BUY signal
-        if overall_score >= 0.6:
+        # Provide detailed output for each weightage
+        lg.info(f"Sentiment Weight: {sentiment_weight * 100}%")
+        lg.info(f"Moving Average Crossover Weight: {ma_weight * 100}%")
+        lg.info(f"MACD Weight: {macd_weight * 100}%")
+        lg.info(f"ADX Weight: {adx_weight * 100}%")
+        lg.info(f"Volume Spike Weight: {volume_weight * 100}%")
+
+        # Use dynamic threshold to decide whether to buy
+        if overall_score >= dynamic_threshold:
             lg.info(f"BUY signal for {self.ticker}. All conditions met.")
-            return True
+            print(f"BUY signal for {self.ticker}.")
         else:
             lg.info(f"NO BUY signal for {self.ticker}. Conditions not met.")
-            return False
+            print(f"NO BUY signal for {self.ticker}.")
 
     def get_account_info(self):
         """
